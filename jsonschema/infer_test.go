@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RussellLuo/jsonschema-go/jsonschema"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/google/jsonschema-go/jsonschema"
 )
 
 type custom int

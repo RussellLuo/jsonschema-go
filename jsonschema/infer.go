@@ -80,6 +80,9 @@ type ForOptions struct {
 // A jsonschema tag on a field is used as the description for the corresponding property.
 // For future compatibility, descriptions must not start with "WORD=", where WORD is a
 // sequence of non-whitespace characters.
+//
+// The "jsonschemax" tag adds validation constraints during inference. See the
+// package documentation for supported keys and compatibility rules.
 func For[T any](opts *ForOptions) (*Schema, error) {
 	if opts == nil {
 		opts = &ForOptions{}
@@ -87,7 +90,8 @@ func For[T any](opts *ForOptions) (*Schema, error) {
 	schemas := maps.Clone(initialSchemaMap)
 	// Add types from the options. They override the default ones.
 	maps.Copy(schemas, opts.TypeSchemas)
-	s, err := forType(reflect.TypeFor[T](), map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas)
+	t := reflect.TypeFor[T]()
+	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, newJSONSchemaxInference(t))
 	if err != nil {
 		var z T
 		return nil, fmt.Errorf("For[%T](): %w", z, err)
@@ -103,7 +107,7 @@ func ForType(t reflect.Type, opts *ForOptions) (*Schema, error) {
 	schemas := maps.Clone(initialSchemaMap)
 	// Add types from the options. They override the default ones.
 	maps.Copy(schemas, opts.TypeSchemas)
-	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas)
+	s, err := forType(t, map[reflect.Type]bool{}, opts.IgnoreInvalidTypes, schemas, newJSONSchemaxInference(t))
 	if err != nil {
 		return nil, fmt.Errorf("ForType(%s): %w", t, err)
 	}
@@ -115,7 +119,7 @@ func f64Ptr(f float64) *float64 {
 	return &f
 }
 
-func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas map[reflect.Type]*Schema) (*Schema, error) {
+func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas map[reflect.Type]*Schema, x *jsonschemaxInference) (*Schema, error) {
 	// Follow pointers: the schema for *T is almost the same as for T, except that
 	// an explicit JSON "null" is allowed for the pointer.
 	allowNull := false
@@ -207,7 +211,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 			return nil, fmt.Errorf("unsupported map key type %v", t.Key().Kind())
 		}
 		s.Type = "object"
-		s.AdditionalProperties, err = forType(t.Elem(), seen, ignore, schemas)
+		s.AdditionalProperties, err = x.inferElement(t, seen, ignore, schemas)
 		if err != nil {
 			return nil, fmt.Errorf("computing map value schema: %v", err)
 		}
@@ -222,7 +226,7 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 		} else {
 			s.Type = "array"
 		}
-		itemsSchema, err := forType(t.Elem(), seen, ignore, schemas)
+		itemsSchema, err := x.inferElement(t, seen, ignore, schemas)
 		if err != nil {
 			return nil, fmt.Errorf("computing element schema: %v", err)
 		}
@@ -251,10 +255,21 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 		// schema has been replaced by a known schema.
 		var skipPath []int
 		for _, field := range reflect.VisibleFields(t) {
+			if skipPath != nil {
+				// Anonymous fields are followed immediately by their promoted fields.
+				// Skip all descendants of a replaced type before checking tags.
+				if len(field.Index) >= len(skipPath) && slices.Equal(field.Index[:len(skipPath)], skipPath) {
+					continue
+				}
+				skipPath = nil
+			}
 			if s.Properties == nil {
 				s.Properties = make(map[string]*Schema)
 			}
 			if field.Anonymous {
+				if err := x.checkAnonymous(t, field); err != nil {
+					return nil, err
+				}
 				override := schemas[field.Type]
 				if override != nil {
 					// Type must be object, and only properties can be set.
@@ -281,6 +296,9 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 					}
 					slices.Sort(keys)
 					for _, name := range keys {
+						if err := x.checkEmbeddedProperty(t, field, name); err != nil {
+							return nil, err
+						}
 						if _, ok := s.Properties[name]; !ok {
 							s.Properties[name] = override.Properties[name].CloneSchemas()
 							s.PropertyOrder = append(s.PropertyOrder, name)
@@ -290,35 +308,12 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 				continue
 			}
 
-			// Check to see if this field has been promoted from a replaced anonymous
-			// type.
-			if skipPath != nil {
-				skip := false
-				if len(field.Index) >= len(skipPath) {
-					skip = true
-					for i, index := range skipPath {
-						if field.Index[i] != index {
-							// If we're no longer in a subfield.
-							skip = false
-							break
-						}
-					}
-				}
-				if skip {
-					continue
-				} else {
-					// Anonymous fields are followed immediately by their promoted fields.
-					// Once we encounter a field that *isn't* promoted, we can stop
-					// checking.
-					skipPath = nil
-				}
-			}
-
 			info := fieldJSONInfo(field)
 			if info.omit {
 				continue
 			}
-			fs, err := forType(field.Type, seen, ignore, schemas)
+			fx := x.field(t, field, info.name)
+			fs, err := forType(field.Type, seen, ignore, schemas, &fx)
 			if err != nil {
 				return nil, err
 			}
@@ -334,6 +329,9 @@ func forType(t reflect.Type, seen map[reflect.Type]bool, ignore bool, schemas ma
 					return nil, fmt.Errorf("tag must not begin with 'WORD=': %q", tag)
 				}
 				fs.Description = tag
+			}
+			if err := x.applyField(&fx, field, info.name, s.Properties, fs); err != nil {
+				return nil, err
 			}
 			s.Properties[info.name] = fs
 

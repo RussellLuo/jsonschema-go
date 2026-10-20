@@ -1,4 +1,4 @@
-module github.com/google/jsonschema-go
+module github.com/RussellLuo/jsonschema-go
 
 go 1.23.0
 
